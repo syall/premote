@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+import os
+import sys
+import json
+import time
+import boto3
+
+PREMOTE_PATH = os.path.expanduser('~/.premote')
+EC2_CLIENT = boto3.client('ec2')
+
+
+def print_usage():
+    """Print Usage Information
+
+    Usage: premote command [argument]
+    Commands:
+    - init   <project-name>
+    - start  <project-name>
+    - delete <project-name>
+    - config
+    - help
+    """
+    print('Usage: premote command [argument]')
+    print('Commands:')
+    print('- init   <project-name>')
+    print('- start  <project-name>')
+    print('- delete <project-name>')
+    print('- config')
+    print('- help')
+
+
+def setup_storage():
+    """Setup Storage for premote
+
+    Storage Structure:
+    ~/.premote/
+    ├── project/ # Stores <project-name>.json
+    ├── meta.json
+    └── premote-keypair.pem
+    """
+    # ~/.premote/
+    path = PREMOTE_PATH
+    if not os.path.exists(path):
+        os.mkdir(path)
+        print(f'Created Directory: {path}')
+    if not os.path.isdir(path):
+        print(f'Invalid Directory: {path}', file=sys.stderr)
+        sys.exit(1)
+
+    # ~/.premote/project/
+    path = f'{PREMOTE_PATH}/project'
+    if not os.path.exists(path):
+        os.mkdir(path)
+        print(f'Created Directory: {path}')
+    if not os.path.isdir(path):
+        print(f'Invalid Directory: {path}', file=sys.stderr)
+        sys.exit(1)
+
+    # ~/.premote/meta.json
+    path = f'{PREMOTE_PATH}/meta.json'
+    if not os.path.exists(path):
+        with open(path, 'w') as f:
+            f.write(json.dumps({
+                "ami_id": '',
+                "sg_id": ''
+            }))
+        print(f'Created File: {path}')
+    if not os.path.isfile(path):
+        print(f'Invalid File: {path}', file=sys.stderr)
+        sys.exit(1)
+
+    # ~/.premote/premote-keypair.pem
+    path = f'{PREMOTE_PATH}/premote-keypair.pem'
+    if not os.path.exists(path):
+        key_pair = EC2_CLIENT.create_key_pair(KeyName='premote-keypair')
+        with open(path, 'w') as f:
+            f.write(str(key_pair.get('KeyMaterial')))
+        os.chmod(path, 0o400)
+        print(f'Created File: {path}')
+    if not os.path.isfile(path):
+        print(f'Invalid File: {path}', file=sys.stderr)
+        sys.exit(1)
+
+
+def init(project):
+    """Initialize Project
+
+    - Check Project Existence
+    - Load Metadata
+    - Create EC2 Instance
+    - Wait Until EC2 Instance is Running
+    - Add Project Data to Storage
+    - Start Project
+    """
+    # Check Project Existence
+    path = f'{PREMOTE_PATH}/project/{project}.json'
+    if os.path.exists(path):
+        if os.path.isfile(path):
+            print(f'Project Already Exists: {project}', file=sys.stderr)
+            sys.exit(1)
+        else:
+            print(f'Invalid File: {path}', file=sys.stderr)
+            sys.exit(1)
+
+    # Load Metadata
+    with open(f'{PREMOTE_PATH}/meta.json', 'r') as f:
+        meta_data = json.load(f)
+        ami_id = meta_data.get('ami_id')
+        sg_id = meta_data.get('sg_id')
+    if ami_id == '' or sg_id == '':
+        config()
+
+    # Create EC2 Instance
+    print('Creating EC2 Instance...')
+    instance = boto3.resource('ec2').create_instances(
+        ImageId=ami_id,
+        MinCount=1,
+        MaxCount=1,
+        InstanceType='t2.micro',
+        KeyName='premote-keypair',
+        SecurityGroupIds=[sg_id]
+    )[0].id
+    print(f'EC2 Instance is Created: {instance}')
+
+    # Wait Until EC2 Instance is Running
+    print(f'Waiting for EC2 Instance: {instance}')
+    EC2_CLIENT.get_waiter('instance_running').wait(InstanceIds=[instance])
+    print(f'EC2 Instance is Running: {instance}')
+
+    # Add Project Data to Storage
+    public_dns = EC2_CLIENT.describe_instances(InstanceIds=[instance]) \
+        .get('Reservations', [{}])[0] \
+        .get('Instances', [{}])[0] \
+        .get('PublicDnsName')
+    with open(path, 'w') as f:
+        f.write(json.dumps({
+            "instance": instance,
+            "public_dns": public_dns
+        }))
+    print(f'Created Project File: {path}')
+
+    # Start Project
+    start(project)
+
+
+def start(project):
+    """Start Project Session
+
+    - Load Project Data from Storage
+    - Start EC2 Instance
+    - Wait until EC2 Instance is Reachable
+    - SSH into EC2 Instance
+    - Stop EC2 Instance
+    """
+    # Load Project Data from Storage
+    path = f'{PREMOTE_PATH}/project/{project}.json'
+    if not os.path.exists(path) or not os.path.isfile(path):
+        print(f'Project does not exist: {project}', file=sys.stderr)
+        sys.exit(1)
+    with open(path, 'r') as f:
+        project_data = json.load(f)
+        instance = project_data.get('instance')
+        public_dns = project_data.get('public_dns')
+
+    # Start EC2 Instance
+    print(f'Starting EC2 Instance: {instance}')
+    EC2_CLIENT.start_instances(InstanceIds=[instance])
+
+    # Wait until EC2 Instance is Reachable
+    tries = 1
+    while tries <= 40:
+        print(f'Waiting for EC2 Instance, Try {tries}: {instance}', end='\r')
+        status = EC2_CLIENT.describe_instance_status(
+            InstanceIds=[instance],
+            Filters=[
+                {"Name": 'instance-status.reachability', "Values": ['passed']},
+                {"Name": 'system-status.reachability', "Values": ['passed']}
+            ]
+        ).get('InstanceStatuses')
+        if len(status) != 0:
+            print(f'EC2 Instance is Reachable: {instance}')
+            break
+        else:
+            time.sleep(15)
+            tries += 1
+    if tries > 40:
+        print(f'EC2 Instance is Unreachable: {instance}', file=sys.stderr)
+        sys.exit(1)
+
+    # SSH into EC2 Instance
+    print(f'SSH into Instance: {instance}')
+    key_path = f'{PREMOTE_PATH}/premote-keypair.pem'
+    ssh_result = os.system(f'ssh -i "{key_path}" ubuntu@{public_dns}')
+    if ssh_result == 0:
+        print(f'Logout of EC2 Instance: {instance}')
+    else:
+        print(f'Error with EC2 Instance: {instance}', file=sys.stderr)
+
+    # Stop EC2 Instance
+    print(f'Stopping EC2 Instance: {instance}')
+    EC2_CLIENT.stop_instances(InstanceIds=[instance])
+    EC2_CLIENT.get_waiter('instance_stopped').wait(InstanceIds=[instance])
+    print(f'EC2 Instance is Stopped: {instance}')
+
+
+def delete(project):
+    """Delete Project
+
+    - Check Project Existence
+    - Load Project Data
+    - Terminate EC2 Instance
+    - Delete Project Data from Storage
+    """
+    # Check Project Existence
+    path = f'{PREMOTE_PATH}/project/{project}.json'
+    if not os.path.exists(path):
+        print(f'Project does not exist: {project}', file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isfile(path):
+        print(f'Invalid File: {path}', file=sys.stderr)
+        sys.exit(1)
+
+    # Load Project Data
+    with open(path, 'r') as f:
+        project_data = json.load(f)
+        instance = project_data.get('instance')
+
+    # Terminate EC2 Instance
+    print(f'Terminating EC2 Instance: {instance}')
+    EC2_CLIENT.terminate_instances(InstanceIds=[instance])
+    EC2_CLIENT.get_waiter('instance_terminated').wait(InstanceIds=[instance])
+    print(f'EC2 Instance terminated: {instance}')
+
+    # Delete Project Data from Storage
+    os.remove(path)
+
+
+def config():
+    """Configure Options for Premote
+
+    - Load Metadata
+    - Amazon Machine Image Id
+    - Security Group Id
+    - Store Metadata
+    """
+    # Load Metadata
+    with open(f'{PREMOTE_PATH}/meta.json', 'r') as f:
+        meta_data = json.load(f)
+        ami_id = meta_data.get('ami_id')
+        sg_id = meta_data.get('sg_id')
+
+    # Amazon Machine Image Id
+    new_ami_id = input(f'Amazon Machine Image Id [{ami_id}]: ')
+    if new_ami_id != '':
+        meta_data['ami_id'] = new_ami_id
+
+    # Security Group Id
+    new_sg_id = input(f'Security Group Id [{sg_id}]: ')
+    if new_sg_id != '':
+        meta_data['sg_id'] = new_sg_id
+
+    # Store Metadata
+    with open(f'{PREMOTE_PATH}/meta.json', 'w') as f:
+        f.write(json.dumps(meta_data))
+
+
+def main():
+    # Number of Arguments
+    num_arguments = len(sys.argv[1:])
+
+    # No Arguments
+    if num_arguments == 0:
+        print_usage()
+        sys.exit(1)
+
+    # Setup
+    setup_storage()
+
+    # Unpack Arguments
+    command, *argument = sys.argv[1:]
+
+    # Commands
+    # init <project-name>
+    if command == 'init' and num_arguments == 2:
+        init(argument[0])
+    # start <project-name>
+    elif command == 'start' and num_arguments == 2:
+        start(argument[0])
+    # delete <project-name>
+    elif command == 'delete' and num_arguments == 2:
+        delete(argument[0])
+    # config
+    elif command == 'config' and num_arguments == 1:
+        config()
+    # help
+    elif command == 'help' and num_arguments == 1:
+        print_usage()
+    # invalid command
+    else:
+        print(f'Invalid Input: {" ".join(sys.argv[1:])}', file=sys.stderr)
+        print_usage()
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
