@@ -8,6 +8,13 @@ premote abstracts an EC2 instance under a project name. When using premote, the 
 
 By managing these events, the accruement of costs is kept to a minimum as long as there are no errors, but those fringe cases can usually be handled manually.
 
+## Motivation
+
+Instead of developing locally, premote connects the user to AWS EC2 instances where small-scale projects are essentially free. This provides several benefits:
+
+- Taking advantage of consistent development environments with Amazon Machine Images
+- Allowing low-spec devices (like Chromebooks) to act as developer machines
+
 ## Usage
 
 ### Installation
@@ -18,13 +25,24 @@ By managing these events, the accruement of costs is kept to a minimum as long a
 
 ### Dependencies
 
-premote is implemented in [Python](https://www.python.org/) and developed using Python 3.8.6, although older versions of Python 3 will probably work since it only depends on the `sys`, `os`, `json`, and `time` from the standard library.
+premote is implemented in [Python](https://www.python.org/) and developed using Python 3.8.6, although older versions of Python 3 will probably work.
 
 [Boto3](https://aws.amazon.com/sdk-for-python/) and its dependencies are the minimal dependencies needed to run premote, while the other dependencies in `requirements.txt` are only used in development.
 
-### AWS Credentials
+### Storage
 
-Since premote uses Boto3, premote requires AWS credentials to access an AWS account programmatically.
+premote uses local storage in `~/.premote/` for individual project information, metadata for creating EC2 instances, and an EC2 private key.
+
+```text
+~/.premote/
+├── project/ # Stores <project>.json files
+├── meta.json
+└── premote-keypair.pem
+```
+
+### AWS
+
+Since premote uses Boto3, premote requires AWS credentials with programmatic access.
 
 A simple guide to set up the credentials can be found in the [Boto3 Quickstart Page](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/quickstart.html#configuration).
 
@@ -37,69 +55,78 @@ For the Access Key Pair, the recommended minimal permissions is attaching the `A
 - Stopping EC2 Instances
 - Terminating EC2 Instances
 
-### Storage
-
-premote uses local storage in `~/.premote/` for individual project information, metadata for creating EC2 instances, and an EC2 private key.
-
-```shell
-~/.premote/
-├── project/ # Stores <project-name>.json
-├── meta.json
-└── premote-keypair.pem
-```
-
 ## Commands
 
-### `init <project-name>`
+### `init <project>`
 
-`init` creates a project based on `<project-name>` by creating and saving information about an EC2 instance, then runs `start` to SSH into the EC2 instance.
+Initializes a new Project with an EC2 Instance, then runs `start <project>` to SSH into the instance.
 
-- Creating an instance takes time until the instance status is `running`.
-- Refer to [`start <project-name>`](#start-project-name) for further notes.
+Notes:
 
-### `start <project-name>`
+- Creating the instance takes time until status is `running`
+- Refer to [`start <project>`](#start-project) for further notes
 
-`start` starts and SSHes into the EC2 instance associated with the project `<project-name>`. When the SSH session is exited properly, the EC2 instance is stopped.
+### `start <project>`
 
-- Starting the instance takes time until it is reachable via SSH.
-- Use the `logout` command or `Ctrl+D` shortcut to properly exit an SSH session.
-- Stopping the instance takes time until the instance status is `stopped`.
+Starts and SSHes into an existing Project EC2 Instance. The instance is stopped when the SSH session is exited properly.
 
-### `delete <project-name>`
+Notes:
 
-`delete` terminates the EC2 instance and deletes the local data associated with the project `<project-name>`.
+- Starting the instance takes time until reachable via SSH
+- Use `logout` or `Ctrl+D` to properly exit an SSH session
+- Stopping the instance takes time until status is `stopped`
 
-- Terminating the instance takes time until the instance status is `terminated`.
+### `delete <project>`
+
+Deletes project and terminates the associated EC2 instance.
+
+Note: Terminating the instance takes time until status is `terminated`
 
 ### `config`
 
-`config` prompts the user for a [Amazon Machine Image (AMI) ID](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/AMIs.html) (format: `ami-**`) and an [EC2 Security Group ID](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-security-groups.html) (format: `sg-**`). If no input is provided, the existing values will be used.
+Configures EC2 creation metadata by prompting for the:
 
-Currently, premote only supports Ubuntu AMIs (recommended 20 or 18 LTS). Other AMIs can be [found](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/finding-an-ami.html), but the SSH command will have to be modified in `premote` line 193. However, it is recommended to either find or build a base AMI that is generalized for most projects so that the configuration does not constantly change.
+- [Amazon Machine Image (AMI) ID](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/AMIs.html) (format: `ami-**`)
+- [EC2 Security Group ID](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-security-groups.html) (format: `sg-**`)
+- SSH Config File Path
+- SSH User associated with the AMI
 
-The selected EC2 Security Group minimally requires an inbound rule for SSH to connect to, but otherwise can be completely customizable:
+If no user input is provided, existing values are kept.
 
-Type | Protocol | Port range | Source
------|----------|------------|----------
-SSH  | TCP      | 22         | 0.0.0.0/0
+Note: The EC2 Security Group requires an inbound rule for SSH
 
-### `help`
+## Technical Notes
 
-`help` will print out the usage information of premote:
+### AWS EC2
 
-```text
-Usage: premote command [argument]
-Commands:
-- init   <project-name>
-- start  <project-name>
-- delete <project-name>
-- config
-- help
-```
+- Every time an instance is started, a new Public DNS is assigned
+- Every time an instance is stopped, its Public DNS is released
+- Instance Status `running` is different than being reachable
+- Instance IDs persist until terminated
+- Instance Storage persists if the AMI has Elastic Block Storage (EBS)
 
-## Motivation
+### Python 3
 
-Instead of developing locally, premote connects the user to AWS EC2 instances where small-scale projects are essentially free. This provides several benefits:
-
-- Taking advantage of consistent development environments with Amazon Machine Images
-- Allowing low-spec devices (like Chromebooks) to act as developer machines
+- `argparse` for CLI arguments:
+  - `subparsers = parser.add_subparsers()`
+  - `subparsers.add_parser()`
+  - `parser.set_defaults()`
+  - `formatter_class=argparse.RawDescriptionHelpFormatter`
+  - `metavar` compared to `dest`
+  - `description` and `epilog`
+- `os` for the file system:
+  - `os.path.exists`
+  - `os.path.isfile`
+  - `os.path.isdir`
+  - `os.path.expanduser`
+  - `os.system`
+- Boto3, the AWS SDK for Python:
+  - `client`, `resource`, `waiter`
+  - Documentation for EC2 is huge and laggy
+- Miscellaneous
+  - `with` does not create a block scope
+  - `print('error msg', file=sys.stderr)`
+  - Iterate `dicts` with `.keys()`, `.values()`, `.items()`
+  - Using `**kwargs` and `\` to write shorter lines
+  - `sys.exit()` for exiting an application
+  - Utility classes with `@staticmethod`

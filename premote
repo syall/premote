@@ -1,306 +1,545 @@
 #!/usr/bin/env python3
+import argparse
+import json
 import os
 import sys
-import json
 import time
+
 import boto3
 
+
+"""premote Local Storage Directory
+
+Storage Structure:
+~/.premote/
+├── project/ # Stores <project>.json files
+├── meta.json
+└── premote-keypair.pem
+"""
 PREMOTE_PATH = os.path.expanduser('~/.premote')
-EC2_CLIENT = boto3.client('ec2')
 
 
-def print_usage():
-    """Print Usage Information
+class SSHConfig():
+    """SSH Config Utility Class
 
-    Usage: premote command [argument]
-    Commands:
-    - init   <project-name>
-    - start  <project-name>
-    - delete <project-name>
+    - Parse SSH Config
+    - Write SSH Config Entries to SSH Config
+    - Add Host to SSH Config
+    - Delete Host from SSH Config
+    """
+
+    @staticmethod
+    def parse_ssh_config():
+        """Parse SSH Config
+
+        - Load Metadata
+        - Split SSH Config
+        - Parse SSH Config Entries
+            - Group SSH Config Entry Lines
+            - Map SSH Config Entry Lines
+            - Add SSH Config Entry to SSH Config Entries
+        - Return SSH Config Entries
+        """
+        # Load Metadata
+        with open(f'{PREMOTE_PATH}/meta.json', 'r') as f:
+            meta_data = json.load(f)
+            ssh_config_path = meta_data.get('ssh_config_path')
+
+        # Split SSH Config
+        with open(os.path.expanduser(ssh_config_path), 'r') as f:
+            ssh_config_data = str(f.read())
+            ssh_config_lines = ssh_config_data.split('\n')
+
+        # Parse SSH Config Entries
+        ssh_config_entries = []
+        i = 0
+        while i < len(ssh_config_lines):
+            # Group SSH Config Entry Lines
+            ssh_entry = []
+            while ssh_config_lines[i] != '':
+                ssh_entry.append(ssh_config_lines[i].strip().split(' '))
+                i += 1
+            # Map SSH Config Entry Lines
+            ssh_host_map = {
+                "Host": ssh_entry[0][1],
+                "attributes": {}
+            }
+            for [key, value] in ssh_entry[1:]:
+                ssh_host_map.get('attributes')[key] = value
+            # Add SSH Config Entry to SSH Config Entries
+            ssh_config_entries.append(ssh_host_map)
+            i += 1
+
+        # Return SSH Config Entries
+        return ssh_config_entries
+
+    @staticmethod
+    def write_ssh_config(ssh_config_entries):
+        """Write SSH Config Entries to SSH Config
+
+        - Load Metadata
+        - Write SSH Config Entries
+        """
+        # Load Metadata
+        with open(f'{PREMOTE_PATH}/meta.json', 'r') as f:
+            meta_data = json.load(f)
+            ssh_config_path = meta_data.get('ssh_config_path')
+
+        # Write SSH Config Entries
+        with open(os.path.expanduser(ssh_config_path), 'w') as f:
+            for i, entry in enumerate(ssh_config_entries):
+                f.write(f'Host {entry.get("Host")}\n')
+                for key, value in entry.get('attributes').items():
+                    f.write(f'  {key} {value}\n')
+                if i < len(ssh_config_entries) - 1:
+                    f.write('\n')
+
+    @staticmethod
+    def add_ssh_host(project, ssh_user, public_dns):
+        """Add Host to SSH Config
+
+        - Load and Parse SSH Config
+        - Add SSH Host
+        - Write SSH Config
+        """
+        # Load and Parse SSH Config
+        ssh_config_entries = SSHConfig.parse_ssh_config()
+
+        # Add SSH Host
+        ssh_config_entries.append({
+            "Host": project,
+            "attributes": {
+                "HostName": public_dns,
+                "IdentityFile": f'{PREMOTE_PATH}/premote-keypair.pem',
+                "User": ssh_user
+            }
+        })
+
+        # Write SSH Config
+        SSHConfig.write_ssh_config(ssh_config_entries)
+
+    @staticmethod
+    def delete_ssh_host(project):
+        """Delete Host from SSH Config
+
+        - Load and Parse SSH Config
+        - Delete SSH Host
+        - Write SSH Config
+        """
+        # Load and Parse SSH Config
+        ssh_config_entries = SSHConfig.parse_ssh_config()
+
+        # Delete SSH Host
+        ssh_config_entries = list(filter(
+            lambda entry: entry.get('Host') != project,
+            ssh_config_entries
+        ))
+
+        # Write SSH Config
+        SSHConfig.write_ssh_config(ssh_config_entries)
+
+
+class Premote():
+    """premote Command Utility Class
+
+    - init   <project>
+    - start  <project>
+    - delete <project>
     - config
-    - help
     """
-    print('Usage: premote command [argument]')
-    print('Commands:')
-    print('- init   <project-name>')
-    print('- start  <project-name>')
-    print('- delete <project-name>')
-    print('- config')
-    print('- help')
 
+    """Boto3 EC2 Client
 
-def setup_storage():
-    """Setup Storage for premote
-
-    Storage Structure:
-    ~/.premote/
-    ├── project/ # Stores <project-name>.json
-    ├── meta.json
-    └── premote-keypair.pem
+    Used for :
+    - Creating an EC2 key pair
+    - Creating EC2 status waiters
+    - Describing EC2 Instances
+    - Managing EC2 Instances
     """
-    # ~/.premote/
-    path = PREMOTE_PATH
-    if not os.path.exists(path):
-        os.mkdir(path)
-        print(f'Created Directory: {path}')
-    if not os.path.isdir(path):
-        print(f'Invalid Directory: {path}', file=sys.stderr)
-        sys.exit(1)
+    EC2_CLIENT = boto3.client('ec2')
 
-    # ~/.premote/project/
-    path = f'{PREMOTE_PATH}/project'
-    if not os.path.exists(path):
-        os.mkdir(path)
-        print(f'Created Directory: {path}')
-    if not os.path.isdir(path):
-        print(f'Invalid Directory: {path}', file=sys.stderr)
-        sys.exit(1)
+    @staticmethod
+    def application():
+        """Start premote Application
 
-    # ~/.premote/meta.json
-    path = f'{PREMOTE_PATH}/meta.json'
-    if not os.path.exists(path):
+        - Setup Argument Parser
+            - init <project>
+            - start <project>
+            - delete <project>
+            - config
+        - Parse Arguments
+        """
+        # Setup Argument Parser
+        parser = argparse.ArgumentParser(**{
+            "formatter_class": argparse.RawDescriptionHelpFormatter,
+            "description":
+            'Project Remote CLI Tool for managing AWS EC2 Instances',
+            "epilog":
+            'Requires:\n' +
+            '- Local Storage   (~/.premote/)\n' +
+            '- AWS Credentials (programmatic access)\n' +
+            '- AWS Permissions (EC2 w/ EC2 key pair)'
+        })
+        subparsers = parser.add_subparsers(**{
+            "title": 'Available commands',
+            "metavar": '<command>'
+        })
+        # init <project>
+        parser_init = subparsers.add_parser('init', **{
+            "formatter_class": argparse.RawDescriptionHelpFormatter,
+            "description":
+            'Initializes a new Project with an EC2 Instance, ' +
+            'then runs "premote start" to SSH into the instance.',
+            "epilog":
+            'Notes:\n' +
+            '- Creating the instance takes time until status is running\n' +
+            '- Refer to "premote start --help" for further notes',
+            "help": 'initialize new project'
+        })
+        parser_init.add_argument('project', **{
+            "metavar": '<project>',
+            "help": 'name of project to initialize'
+        })
+        parser_init.set_defaults(
+            func=lambda args: Premote.init(args.project))
+        # start <project>
+        parser_start = subparsers.add_parser('start', **{
+            "formatter_class": argparse.RawDescriptionHelpFormatter,
+            "description":
+            'Starts and SSHes into an existing Project EC2 Instance. ' +
+            'The instance is stopped when the SSH session is exited properly.',
+            "epilog":
+            'Notes:\n' +
+            '- Starting the instance takes time until reachable via SSH\n' +
+            '- Use "logout" or "Ctrl+D" to properly exit an SSH session\n' +
+            '- Stopping the instance takes time until status is stopped',
+            "help": 'start existing project'
+        })
+        parser_start.add_argument('project', **{
+            "metavar": '<project>',
+            "help": 'name of project to start'
+        })
+        parser_start.set_defaults(
+            func=lambda args: Premote.start(args.project))
+        # delete <project>
+        parser_delete = subparsers.add_parser('delete', **{
+            "formatter_class": argparse.RawDescriptionHelpFormatter,
+            "description":
+            'Deletes project and terminates the associated EC2 instance.',
+            "epilog":
+            'Note: ' +
+            'Terminating the instance takes time until status is terminated',
+            "help": 'delete existing project'
+        })
+        parser_delete.add_argument('project', **{
+            "metavar": '<project>',
+            "help": 'name of project to delete'
+        })
+        parser_delete.set_defaults(
+            func=lambda args: Premote.delete(args.project))
+        # config
+        parser_config = subparsers.add_parser('config', **{
+            "formatter_class": argparse.RawDescriptionHelpFormatter,
+            "description":
+            'Configures EC2 creation metadata by prompting for the:\n' +
+            '- Amazon Machine Image (AMI) ID (format: ami-**)\n' +
+            '- EC2 Security Group ID         (format: sg-**)\n' +
+            '- SSH Config File Path\n' +
+            '- SSH User associated with the AMI\n' +
+            'If no user input is provided, existing values are kept.',
+            "epilog":
+            'Note: ' +
+            'The EC2 Security Group requires an inbound rule for SSH',
+            "help": 'configure EC2 metadata'
+        })
+        parser_config.set_defaults(
+            func=lambda _: Premote.config())
+
+        # Parse Arguments
+        args = parser.parse_args()
+        if hasattr(args, 'func'):
+            Premote.setup_storage()
+            args.func(args)
+        else:
+            parser.print_help()
+
+    @staticmethod
+    def setup_storage():
+        """Setup Storage for premote
+
+        Storage Structure:
+        ~/.premote/
+        ├── project/ # Stores <project>.json files
+        ├── meta.json
+        └── premote-keypair.pem
+        """
+        # ~/.premote/
+        path = PREMOTE_PATH
+        if not os.path.exists(path):
+            os.mkdir(path)
+            print(f'Created premote directory: {path}')
+        if not os.path.isdir(path):
+            print(f'Invalid premote directory: {path}', file=sys.stderr)
+            sys.exit(1)
+
+        # ~/.premote/project/
+        path = f'{PREMOTE_PATH}/project'
+        if not os.path.exists(path):
+            os.mkdir(path)
+            print(f'Created project directory: {path}')
+        if not os.path.isdir(path):
+            print(f'Invalid project directory: {path}', file=sys.stderr)
+            sys.exit(1)
+
+        # ~/.premote/meta.json
+        path = f'{PREMOTE_PATH}/meta.json'
+        if not os.path.exists(path):
+            with open(path, 'w') as f:
+                f.write(json.dumps({
+                    "ami_id": '',
+                    "sg_id": '',
+                    "ssh_config_path": '',
+                    "ssh_user": ''
+                }))
+            print(f'Created metadata file: {path}')
+        if not os.path.isfile(path):
+            print(f'Invalid metadata file: {path}', file=sys.stderr)
+            sys.exit(1)
+
+        # ~/.premote/premote-keypair.pem
+        path = f'{PREMOTE_PATH}/premote-keypair.pem'
+        if not os.path.exists(path):
+            key_pair = Premote.EC2_CLIENT \
+                .create_key_pair(KeyName='premote-keypair')
+            with open(path, 'w') as f:
+                f.write(str(key_pair.get('KeyMaterial')))
+            os.chmod(path, 0o400)
+            print(f'Created premote-keypair file: {path}')
+        if not os.path.isfile(path):
+            print(f'Invalid premote-keypair file: {path}', file=sys.stderr)
+            sys.exit(1)
+
+    @staticmethod
+    def init(project):
+        """Initialize Project
+
+        - Check Project Existence
+        - Load Metadata
+        - Create EC2 Instance
+        - Add Project Data to Storage
+        - Start Project
+        """
+        # Check Project Existence
+        path = f'{PREMOTE_PATH}/project/{project}.json'
+        if os.path.exists(path):
+            if os.path.isfile(path):
+                print(f'Project already exists: {project}', file=sys.stderr)
+            else:
+                print(f'Invalid project file: {path}', file=sys.stderr)
+            sys.exit(1)
+
+        # Load Metadata
+        with open(f'{PREMOTE_PATH}/meta.json', 'r') as f:
+            meta_data = json.load(f)
+            if any(value == '' for value in meta_data.values()):
+                print('Empty metadata: run "premote config"', file=sys.stderr)
+                sys.exit(1)
+            ami_id = meta_data.get('ami_id')
+            sg_id = meta_data.get('sg_id')
+            ssh_user = meta_data.get('ssh_user')
+
+        # Create EC2 Instance
+        print('Creating EC2 Instance...')
+        instance = boto3.resource('ec2').create_instances(
+            ImageId=ami_id,
+            MinCount=1,
+            MaxCount=1,
+            InstanceType='t2.micro',
+            KeyName='premote-keypair',
+            SecurityGroupIds=[sg_id]
+        )[0].id
+        print(f'EC2 Instance is Created: {instance}')
+
+        # Add Project Data to Storage
         with open(path, 'w') as f:
             f.write(json.dumps({
-                "ami_id": '',
-                "sg_id": ''
+                "user": ssh_user,
+                "instance": instance
             }))
-        print(f'Created File: {path}')
-    if not os.path.isfile(path):
-        print(f'Invalid File: {path}', file=sys.stderr)
-        sys.exit(1)
+        print(f'Created project file: {path}')
 
-    # ~/.premote/premote-keypair.pem
-    path = f'{PREMOTE_PATH}/premote-keypair.pem'
-    if not os.path.exists(path):
-        key_pair = EC2_CLIENT.create_key_pair(KeyName='premote-keypair')
-        with open(path, 'w') as f:
-            f.write(str(key_pair.get('KeyMaterial')))
-        os.chmod(path, 0o400)
-        print(f'Created File: {path}')
-    if not os.path.isfile(path):
-        print(f'Invalid File: {path}', file=sys.stderr)
-        sys.exit(1)
+        # Start Project
+        Premote.start(project)
 
+    @staticmethod
+    def start(project):
+        """Start Project Session
 
-def init(project):
-    """Initialize Project
-
-    - Check Project Existence
-    - Load Metadata
-    - Create EC2 Instance
-    - Wait Until EC2 Instance is Running
-    - Add Project Data to Storage
-    - Start Project
-    """
-    # Check Project Existence
-    path = f'{PREMOTE_PATH}/project/{project}.json'
-    if os.path.exists(path):
-        if os.path.isfile(path):
-            print(f'Project Already Exists: {project}', file=sys.stderr)
+        - Load Project Data from Storage
+        - Start EC2 Instance
+        - Get Public DNS of EC2 Instance
+        - Add EC2 Instance to SSH Config
+        - Wait until EC2 Instance is Reachable
+        - SSH into EC2 Instance
+        - Delete EC2 Instance from SSH Config
+        - Stop EC2 Instance
+        """
+        # Load Project Data from Storage
+        path = f'{PREMOTE_PATH}/project/{project}.json'
+        if not os.path.exists(path):
+            print(f'Project does not exist: {project}', file=sys.stderr)
             sys.exit(1)
-        else:
-            print(f'Invalid File: {path}', file=sys.stderr)
+        if not os.path.isfile(path):
+            print(f'Invalid project file: {path}', file=sys.stderr)
+            sys.exit(1)
+        with open(path, 'r') as f:
+            project_data = json.load(f)
+            user = project_data.get('user')
+            instance = project_data.get('instance')
+
+        # Start EC2 Instance
+        print(f'Starting EC2 Instance: {instance}')
+        Premote.EC2_CLIENT.start_instances(InstanceIds=[instance])
+        Premote.EC2_CLIENT \
+            .get_waiter('instance_running') \
+            .wait(InstanceIds=[instance])
+        print(f'EC2 Instance is running: {instance}')
+
+        # Get Public DNS of EC2 Instance
+        public_dns = Premote.EC2_CLIENT \
+            .describe_instances(InstanceIds=[instance]) \
+            .get('Reservations', [{}])[0] \
+            .get('Instances', [{}])[0] \
+            .get('PublicDnsName')
+
+        # Add EC2 Instance to SSH Config
+        SSHConfig.add_ssh_host(project, user, public_dns)
+
+        # Wait until EC2 Instance is Reachable
+        tries = 1
+        while tries <= 40:
+            print(f'Waiting for EC2 Instance, {tries}: {instance}', end='\r')
+            status = Premote.EC2_CLIENT \
+                .describe_instance_status(
+                    InstanceIds=[instance],
+                    Filters=[
+                        {
+                            "Name": 'instance-status.reachability',
+                            "Values": ['passed']
+                        },
+                        {
+                            "Name": 'system-status.reachability',
+                            "Values": ['passed']
+                        }
+                    ]) \
+                .get('InstanceStatuses')
+            if len(status) != 0:
+                print(f'EC2 Instance is reachable: {instance}')
+                break
+            else:
+                time.sleep(15)
+                tries += 1
+        if tries > 40:
+            print(f'EC2 Instance is unreachable: {instance}', file=sys.stderr)
             sys.exit(1)
 
-    # Load Metadata
-    with open(f'{PREMOTE_PATH}/meta.json', 'r') as f:
-        meta_data = json.load(f)
-        ami_id = meta_data.get('ami_id')
-        sg_id = meta_data.get('sg_id')
-    if ami_id == '' or sg_id == '':
-        config()
-
-    # Create EC2 Instance
-    print('Creating EC2 Instance...')
-    instance = boto3.resource('ec2').create_instances(
-        ImageId=ami_id,
-        MinCount=1,
-        MaxCount=1,
-        InstanceType='t2.micro',
-        KeyName='premote-keypair',
-        SecurityGroupIds=[sg_id]
-    )[0].id
-    print(f'EC2 Instance is Created: {instance}')
-
-    # Wait Until EC2 Instance is Running
-    print(f'Waiting for EC2 Instance: {instance}')
-    EC2_CLIENT.get_waiter('instance_running').wait(InstanceIds=[instance])
-    print(f'EC2 Instance is Running: {instance}')
-
-    # Add Project Data to Storage
-    public_dns = EC2_CLIENT.describe_instances(InstanceIds=[instance]) \
-        .get('Reservations', [{}])[0] \
-        .get('Instances', [{}])[0] \
-        .get('PublicDnsName')
-    with open(path, 'w') as f:
-        f.write(json.dumps({
-            "instance": instance,
-            "public_dns": public_dns
-        }))
-    print(f'Created Project File: {path}')
-
-    # Start Project
-    start(project)
-
-
-def start(project):
-    """Start Project Session
-
-    - Load Project Data from Storage
-    - Start EC2 Instance
-    - Wait until EC2 Instance is Reachable
-    - SSH into EC2 Instance
-    - Stop EC2 Instance
-    """
-    # Load Project Data from Storage
-    path = f'{PREMOTE_PATH}/project/{project}.json'
-    if not os.path.exists(path) or not os.path.isfile(path):
-        print(f'Project does not exist: {project}', file=sys.stderr)
-        sys.exit(1)
-    with open(path, 'r') as f:
-        project_data = json.load(f)
-        instance = project_data.get('instance')
-        public_dns = project_data.get('public_dns')
-
-    # Start EC2 Instance
-    print(f'Starting EC2 Instance: {instance}')
-    EC2_CLIENT.start_instances(InstanceIds=[instance])
-
-    # Wait until EC2 Instance is Reachable
-    tries = 1
-    while tries <= 40:
-        print(f'Waiting for EC2 Instance, Try {tries}: {instance}', end='\r')
-        status = EC2_CLIENT.describe_instance_status(
-            InstanceIds=[instance],
-            Filters=[
-                {"Name": 'instance-status.reachability', "Values": ['passed']},
-                {"Name": 'system-status.reachability', "Values": ['passed']}
-            ]
-        ).get('InstanceStatuses')
-        if len(status) != 0:
-            print(f'EC2 Instance is Reachable: {instance}')
-            break
+        # SSH into EC2 Instance
+        print(f'SSH into EC2 Instance: {instance}')
+        key_path = f'{PREMOTE_PATH}/premote-keypair.pem'
+        ssh_result = os.system(f'ssh -i "{key_path}" {user}@{public_dns}')
+        if ssh_result == 0:
+            print(f'Logout of EC2 Instance: {instance}')
         else:
-            time.sleep(15)
-            tries += 1
-    if tries > 40:
-        print(f'EC2 Instance is Unreachable: {instance}', file=sys.stderr)
-        sys.exit(1)
+            print(f'Error with EC2 Instance: {instance}', file=sys.stderr)
 
-    # SSH into EC2 Instance
-    print(f'SSH into Instance: {instance}')
-    key_path = f'{PREMOTE_PATH}/premote-keypair.pem'
-    ssh_result = os.system(f'ssh -i "{key_path}" ubuntu@{public_dns}')
-    if ssh_result == 0:
-        print(f'Logout of EC2 Instance: {instance}')
-    else:
-        print(f'Error with EC2 Instance: {instance}', file=sys.stderr)
+        # Delete EC2 Instance from SSH Config
+        SSHConfig.delete_ssh_host(project)
 
-    # Stop EC2 Instance
-    print(f'Stopping EC2 Instance: {instance}')
-    EC2_CLIENT.stop_instances(InstanceIds=[instance])
-    EC2_CLIENT.get_waiter('instance_stopped').wait(InstanceIds=[instance])
-    print(f'EC2 Instance is Stopped: {instance}')
+        # Stop EC2 Instance
+        print(f'Stopping EC2 Instance: {instance}')
+        Premote.EC2_CLIENT.stop_instances(InstanceIds=[instance])
+        Premote.EC2_CLIENT \
+            .get_waiter('instance_stopped') \
+            .wait(InstanceIds=[instance])
+        print(f'EC2 Instance is stopped: {instance}')
 
+    @staticmethod
+    def delete(project):
+        """Delete Project
 
-def delete(project):
-    """Delete Project
+        - Check Project Existence
+        - Load Project Data
+        - Terminate EC2 Instance
+        - Delete Project Data from Storage
+        """
+        # Check Project Existence
+        path = f'{PREMOTE_PATH}/project/{project}.json'
+        if not os.path.exists(path):
+            print(f'Project does not exist: {project}', file=sys.stderr)
+            sys.exit(1)
+        if not os.path.isfile(path):
+            print(f'Invalid project file: {path}', file=sys.stderr)
+            sys.exit(1)
 
-    - Check Project Existence
-    - Load Project Data
-    - Terminate EC2 Instance
-    - Delete Project Data from Storage
-    """
-    # Check Project Existence
-    path = f'{PREMOTE_PATH}/project/{project}.json'
-    if not os.path.exists(path):
-        print(f'Project does not exist: {project}', file=sys.stderr)
-        sys.exit(1)
-    if not os.path.isfile(path):
-        print(f'Invalid File: {path}', file=sys.stderr)
-        sys.exit(1)
+        # Load Project Data
+        with open(path, 'r') as f:
+            project_data = json.load(f)
+            instance = project_data.get('instance')
 
-    # Load Project Data
-    with open(path, 'r') as f:
-        project_data = json.load(f)
-        instance = project_data.get('instance')
+        # Terminate EC2 Instance
+        print(f'Terminating EC2 Instance: {instance}')
+        Premote.EC2_CLIENT.terminate_instances(InstanceIds=[instance])
+        Premote.EC2_CLIENT \
+            .get_waiter('instance_terminated') \
+            .wait(InstanceIds=[instance])
+        print(f'EC2 Instance is terminated: {instance}')
 
-    # Terminate EC2 Instance
-    print(f'Terminating EC2 Instance: {instance}')
-    EC2_CLIENT.terminate_instances(InstanceIds=[instance])
-    EC2_CLIENT.get_waiter('instance_terminated').wait(InstanceIds=[instance])
-    print(f'EC2 Instance terminated: {instance}')
+        # Delete Project Data from Storage
+        os.remove(path)
 
-    # Delete Project Data from Storage
-    os.remove(path)
+    @staticmethod
+    def config():
+        """Configure Options for premote
 
+        - Load Metadata
+        - Amazon Machine Image Id
+        - Security Group Id
+        - SH Config Path
+        - SSH User
+        - Store Metadata
+        """
+        # Load Metadata
+        with open(f'{PREMOTE_PATH}/meta.json', 'r') as f:
+            meta_data = json.load(f)
+            ami_id = meta_data.get('ami_id')
+            sg_id = meta_data.get('sg_id')
+            ssh_config_path = meta_data.get('ssh_config_path')
+            ssh_user = meta_data.get('ssh_user')
 
-def config():
-    """Configure Options for Premote
+        # Amazon Machine Image Id
+        new_ami_id = input(f'Amazon Machine Image Id [{ami_id}]: ')
+        if new_ami_id != '':
+            meta_data['ami_id'] = new_ami_id
 
-    - Load Metadata
-    - Amazon Machine Image Id
-    - Security Group Id
-    - Store Metadata
-    """
-    # Load Metadata
-    with open(f'{PREMOTE_PATH}/meta.json', 'r') as f:
-        meta_data = json.load(f)
-        ami_id = meta_data.get('ami_id')
-        sg_id = meta_data.get('sg_id')
+        # Security Group Id
+        new_sg_id = input(f'Security Group Id [{sg_id}]: ')
+        if new_sg_id != '':
+            meta_data['sg_id'] = new_sg_id
 
-    # Amazon Machine Image Id
-    new_ami_id = input(f'Amazon Machine Image Id [{ami_id}]: ')
-    if new_ami_id != '':
-        meta_data['ami_id'] = new_ami_id
+        # SSH Config Path
+        new_ssh_config_path = input(f'SSH Config Path [{ssh_config_path}]: ')
+        if new_ssh_config_path != '':
+            meta_data['ssh_config_path'] = new_ssh_config_path
 
-    # Security Group Id
-    new_sg_id = input(f'Security Group Id [{sg_id}]: ')
-    if new_sg_id != '':
-        meta_data['sg_id'] = new_sg_id
+        # SSH User
+        new_ssh_user = input(f'SSH User [{ssh_user}]: ')
+        if new_ssh_user != '':
+            meta_data['ssh_user'] = new_ssh_user
 
-    # Store Metadata
-    with open(f'{PREMOTE_PATH}/meta.json', 'w') as f:
-        f.write(json.dumps(meta_data))
-
-
-def main():
-    # Number of Arguments
-    num_arguments = len(sys.argv[1:])
-
-    # No Arguments
-    if num_arguments == 0:
-        print_usage()
-        sys.exit(1)
-
-    # Setup
-    setup_storage()
-
-    # Unpack Arguments
-    command, *argument = sys.argv[1:]
-
-    # Commands
-    # init <project-name>
-    if command == 'init' and num_arguments == 2:
-        init(argument[0])
-    # start <project-name>
-    elif command == 'start' and num_arguments == 2:
-        start(argument[0])
-    # delete <project-name>
-    elif command == 'delete' and num_arguments == 2:
-        delete(argument[0])
-    # config
-    elif command == 'config' and num_arguments == 1:
-        config()
-    # help
-    elif command == 'help' and num_arguments == 1:
-        print_usage()
-    # invalid command
-    else:
-        print(f'Invalid Input: {" ".join(sys.argv[1:])}', file=sys.stderr)
-        print_usage()
-        sys.exit(1)
+        # Store Metadata
+        with open(f'{PREMOTE_PATH}/meta.json', 'w') as f:
+            f.write(json.dumps(meta_data))
 
 
 if __name__ == '__main__':
-    main()
+    Premote.application()
