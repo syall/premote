@@ -246,6 +246,7 @@ class Premote():
             '- EC2 Security Group ID         (format: sg-**)\n' +
             '- SSH Config File Path\n' +
             '- SSH User associated with the AMI\n' +
+            '- EC2 Instance Type\n' +
             'If no user input is provided, existing values are kept.',
             "epilog":
             'Note: ' +
@@ -299,7 +300,8 @@ class Premote():
                     "ami_id": '',
                     "sg_id": '',
                     "ssh_config_path": '',
-                    "ssh_user": ''
+                    "ssh_user": '',
+                    "ec2_type": ''
                 }))
             print(f'Created metadata file: {path}')
         if not os.path.isfile(path):
@@ -347,6 +349,7 @@ class Premote():
             ami_id = meta_data.get('ami_id')
             sg_id = meta_data.get('sg_id')
             ssh_user = meta_data.get('ssh_user')
+            ec2_type = meta_data.get('ec2_type')
 
         # Create EC2 Instance
         print('Creating EC2 Instance...')
@@ -354,7 +357,7 @@ class Premote():
             ImageId=ami_id,
             MinCount=1,
             MaxCount=1,
-            InstanceType='t2.micro',
+            InstanceType=ec2_type,
             KeyName='premote-keypair',
             SecurityGroupIds=[sg_id]
         )[0].id
@@ -506,6 +509,7 @@ class Premote():
         - Security Group Id
         - SH Config Path
         - SSH User
+        - EC2 Instance Type
         - Store Metadata
         """
         # Load Metadata
@@ -515,6 +519,7 @@ class Premote():
             sg_id = meta_data.get('sg_id')
             ssh_config_path = meta_data.get('ssh_config_path')
             ssh_user = meta_data.get('ssh_user')
+            ec2_type = meta_data.get('ec2_type')
 
         # Amazon Machine Image Id
         new_ami_id = input(f'Amazon Machine Image Id [{ami_id}]: ')
@@ -535,6 +540,11 @@ class Premote():
         new_ssh_user = input(f'SSH User [{ssh_user}]: ')
         if new_ssh_user != '':
             meta_data['ssh_user'] = new_ssh_user
+
+        # EC2 Instance Type
+        new_ec2_type = input(f'EC2 Instance Type [{ec2_type}]: ')
+        if new_ec2_type != '':
+            meta_data['ec2_type'] = new_ec2_type
 
         # Store Metadata
         with open(f'{PREMOTE_PATH}/meta.json', 'w') as f:

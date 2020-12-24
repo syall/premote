@@ -90,6 +90,7 @@ Configures EC2 creation metadata by prompting for the:
 - [EC2 Security Group ID](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-security-groups.html) (format: `sg-**`)
 - SSH Config File Path
 - SSH User associated with the AMI
+- [EC2 Instance Type](https://aws.amazon.com/ec2/instance-types/)
 
 If no user input is provided, existing values are kept.
 
